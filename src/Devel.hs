@@ -4,26 +4,23 @@
 {-# LANGUAGE FlexibleContexts  #-}
 module Main where
 
-import qualified Distribution.Compiler                 as D
 import qualified Distribution.ModuleName               as D
 import qualified Distribution.PackageDescription       as D
 import qualified Distribution.PackageDescription.Parse as D
-import qualified Distribution.Simple.Configure         as D
-import qualified Distribution.Simple.Program           as D
 import qualified Distribution.Simple.Utils             as D
 import qualified Distribution.Verbosity                as D
 
-import           Control.Applicative ((<|>), many, (<$>))
-import           Control.Arrow ((***))
+import           Control.Applicative ((<|>), many)
 import           Control.Concurrent (threadDelay)
-import           Control.Concurrent.Async (race_, async, withAsync, wait, cancel)
+import           Control.Concurrent.Async (async)
 import           Control.Concurrent.STM
+import           Control.Concurrent.STM.TMVar
 import qualified Control.Exception as Ex
 import           Control.Exception.Lifted (handle)
-import           Control.Monad (join, mfilter, forever, unless, void, when, forM, forM_, filterM)
+import           Control.Monad (forever, unless, void, when, forM, forM_, filterM)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Trans.State (StateT, get, put, execStateT, runStateT)
-import           Control.Monad.Trans.Writer (WriterT, tell, execWriterT, runWriterT)
+import           Control.Monad.Trans.State (StateT, get, put, runStateT)
+import           Control.Monad.Trans.Writer (WriterT, tell, execWriterT)
 import           Control.Monad.Trans.Class (lift)
 import qualified Data.Attoparsec.Text as A
 import qualified Data.ByteString.Lazy as LB
@@ -36,7 +33,6 @@ import           Data.Default.Class (def)
 import           Data.FileEmbed (embedFile)
 import           Data.Function
 import qualified Data.IORef as I
-import           Data.List (sortBy)
 import           Data.Maybe
 import           Data.Monoid
 import           Data.Ord
@@ -46,7 +42,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
 import qualified Data.Text.IO as Text
-import           Filesystem.Path.CurrentOS (toText, filename, fromText)
+import           Filesystem.Path.CurrentOS (toText, filename, extension)
 import           Filesystem.Path (FilePath, )
 import qualified Filesystem as FS
 import           Network (withSocketsDo)
@@ -72,7 +68,7 @@ import           System.FSNotify
 import           System.Posix.Types                    (EpochTime)
 import           System.PosixCompat.Files              (getFileStatus,
                                                         modificationTime, accessTime)
-import           IdeSession hiding (updateSession)
+import           IdeSession hiding (updateSession, initSession)
 import           Devel.Cabal
 import           Devel.CmdLine
 
@@ -81,18 +77,52 @@ import           Text.Julius      (juliusUsedIdentifiers)
 import           Text.Cassius     (cassiusUsedIdentifiers)
 import           Text.Lucius      (luciusUsedIdentifiers)
 
-type UpdateSession = TVar (IdeSessionUpdate -> IO (Maybe [Either Text Error]))
+type UpdateSession = IdeSessionUpdate -> IO (Maybe [Either Text Error])
+type Runner = Maybe (RunActions RunResult)
 
+data FileChangeType = FileAdded | FileModified | FileRemoved
+    deriving (Show, Eq)
 
-watchThread :: TChan Event -> IO ()
+data FileType = HaskellFile | DataFile | CabalFile
+    deriving (Show, Eq)
+
+data FileChange = FileChange
+                  {fileChangePath :: String
+                  ,fileChangeType :: FileChangeType
+                  ,fileType       :: FileType}
+    deriving (Show, Eq)
+
+data RunCommand = Start | Stop
+
+watchThread :: TChan FileChange -> IO ()
 watchThread writeChan = withManager (\mgr ->
   do dir <- fmap (either id id . toText) FS.getWorkingDirectory
      _ <- watchTree mgr                 -- manager
                     "."                 -- directory to watch
                     (shouldReload dir)  -- predicate
-                    (\e -> atomically (writeTChan writeChan e))  -- action
+                    (atomically . writeTChan writeChan . toFileChange)
      -- sleep forever (until interrupted)
      forever $ threadDelay (1000 * 1000 * 10))
+  where toFileChange event =
+          let stringPath = fpToString filePath
+              filePath = eventPath event
+              fileType = whichFileType filePath
+              fileChangeType =
+                case event of
+                  Added _ _    -> FileAdded
+                  Removed _ _  -> FileRemoved
+                  Modified _ _ -> FileModified
+          in FileChange stringPath fileChangeType fileType
+        whichFileType filePath
+          | isHsFile    filePath = HaskellFile
+          | isCabalFile filePath = CabalFile
+          | otherwise            = DataFile
+        isHsFile :: FilePath -> Bool
+        isHsFile fp = any (`elem` extension fp) haskellFileExts
+        isCabalFile fp = filename fp == "cabal.sandbox.config" || ".cabal" `elem` extension fp
+        haskellFileExts :: [Text]
+        haskellFileExts = ["hs","hsc","lhs"]
+        fpToString = Text.unpack . either id id . toText
 
 shouldReload :: Text -> Event -> Bool
 shouldReload dir event = not (or conditions)
@@ -131,135 +161,134 @@ handleStatusUpdates loading' =
               do let stepReport = mconcat ["[", show step, " of ", show steps, "] "]
                  Text.putStrLn (Text.pack stepReport <> msg)
 
-handleFilesChanged :: TChan Event -> TVar ([String], Deps) -> TVar IdeSession -> UpdateSession -> IO ()
-handleFilesChanged filesChanged' depsTVar sessionTVar updateSessionTVar =
+handleFilesChanged :: TChan FileChange
+                   -> TVar Deps
+                   -> TVar IdeSession
+                   -> TMVar RunCommand
+                   -> TVar UpdateSession
+                   -> TChan LoadingStatus
+                   -> IO ()
+handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSessionTVar loading =
   do filesChanged <- atomically (dupTChan filesChanged')
      lastChangedFileRef <- I.newIORef Nothing
      forever $
-       do event <- atomically $ readTChan filesChanged
+       do (FileChange filePath fileChangeType fileType) <- atomically $ readTChan filesChanged
           lastChangedFile <- I.readIORef lastChangedFileRef
-          let fp = (eventPath event)
-          content <- LB.readFile (fpString fp)
-          I.writeIORef lastChangedFileRef (Just (fp, content))
-          unless (lastChangedFile == Just (fp, content)) $
-            do (_, deps) <- atomically (readTVar depsTVar)
-               -- t <- (updatedDeps deps) mempty
+          content <- LB.readFile filePath
+          I.writeIORef lastChangedFileRef (Just (filePath, content))
+          unless (lastChangedFile == Just (filePath, content)) $
+            do deps <- atomically (readTVar depsTVar)
                let changes = runStateT (execWriterT (updatedDeps deps))
                (depHsFiles, _) <- changes mempty
-               putStrLn "----changes----"
-               print depHsFiles
-               print event
-               putStrLn "----/changes----"
-               case event of
-                 Added filePath _ -> addFile (fpString filePath) depHsFiles
-                 Modified filePath _ -> update (fpString filePath) depHsFiles
-                 Removed filePath _ ->
-                   if isHsFile (fpString filePath)
-                      then updateFile (updateSourceFileDelete (fpString filePath))
-                      else updateFile (updateDataFileDelete (fpString filePath))
-  where toText' fp =
-          case toText fp of
-              Left filePath -> filePath
-              Right filePath -> filePath
-        isHsFile fp = any (`Text.isSuffixOf` Text.pack fp) haskellFileExts
-        haskellFileExts :: [Text]
-        haskellFileExts = ["hs","hsc","lhs"]
-        fpString = Text.unpack . toText'
-        addFile :: String -> [String] -> IO ()
-        addFile fp extraFiles =
-          let extra = getExtra extraFiles
-          in if isHsFile fp
-                 then    updateFile (updateSourceFileFromFile fp <> mconcat extra)
-                 else do content <- LB.readFile fp
-                         updateFile (updateDataFile fp content <> mconcat extra)
-        update :: String  -> [String] -> IO ()
-        update filePath extraFiles =
-          do develHsPath <- checkDevelFile
-             updateSession <- atomically (readTVar updateSessionTVar)
-             let extra = getExtra extraFiles
-             if isHsFile filePath
-                 then    updateFile (updateSourceFileFromFile filePath <> mconcat extra)
-                 else do content <- LB.readFile filePath
-                         updateFile (updateDataFile filePath content <> mconcat extra)
+               let extra = mconcat (getExtra depHsFiles)
+               case (fileChangeType, fileType) of
+                 (FileAdded,    HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
+                 (FileAdded,    DataFile)    -> updateFile (updateDataFile           filePath content <> extra)
+                 (FileModified, HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
+                 (FileModified, DataFile)    -> updateFile (updateDataFile           filePath content <> extra)
+                 (FileRemoved,  HaskellFile) -> updateFile (updateSourceFileDelete   filePath)
+                 (FileRemoved,  DataFile)    -> updateFile (updateDataFileDelete     filePath)
+                 (_,            CabalFile)   ->
+                   do atomically (putTMVar runCommandTMVar Stop)
+                      session <- atomically (readTVar sessionTVar)
+                      shutdownSession session
+                      (newSession, newUpdateSession, newDeps) <- initSession loading
+                      atomically $ do writeTVar sessionTVar newSession
+                                      writeTVar updateSessionTVar newUpdateSession
+                                      writeTVar depsTVar newDeps
+                      atomically (putTMVar runCommandTMVar Start)
+  where getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
         updateFile :: IdeSessionUpdate -> IO ()
         updateFile upd =
           do develHsPath <- checkDevelFile
+             atomically (putTMVar runCommandTMVar Stop)
              updateSession <- atomically (readTVar updateSessionTVar)
-             updateSession (upd <> updateSourceFileFromFile develHsPath)
-             return ()
-        getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
+             void (updateSession (upd <> updateSourceFileFromFile develHsPath))
+             atomically (putTMVar runCommandTMVar Start)
 
 main :: IO ()
 main = do
   opts@Options{..} <- getCommandLineOptions
   loading <- newTChanIO
   filesChanged <- newTChanIO
-  (session, updateSession) <- startSession loading
-  (hsSourceDirs, _) <- checkCabalFile
-  deps <- getDeps hsSourceDirs
+  (session, updateSession, deps) <- initSession loading
   depsTVar <- newTVarIO deps
   updateSessionTVar <- newTVarIO updateSession
   sessionTVar <- newTVarIO session
-  a <- async (runDevel opts sessionTVar loading)
-  _ <- async (handleStatusUpdates loading)
-  _ <- async (watchThread filesChanged)
-  _ <- async (handleFilesChanged filesChanged depsTVar sessionTVar updateSessionTVar)
-  develHsPath <- checkDevelFile
-  content <- LB.readFile develHsPath
-  updateSession (updateSourceFile develHsPath content)
-  threadDelay (1000 * 1000 * 60 * 60 * 24 * 365) `Ex.finally` (cancel a >> wait a)
+  runnerTVar <- newTVarIO Nothing
+  runCommandTMVar <- newEmptyTMVarIO
+  atomically (putTMVar runCommandTMVar Start)
+  Ex.bracket_
+     (do _ <- async (runDevel opts sessionTVar runnerTVar runCommandTMVar)
+         _ <- async (handleStatusUpdates loading)
+         _ <- async (watchThread filesChanged)
+         _ <- async (handleFilesChanged filesChanged depsTVar sessionTVar runCommandTMVar updateSessionTVar loading)
+         return ())
+     (threadDelay (1000 * 1000 * 60 * 60 * 24 * 365)) -- run devel server for up to one year
+     (do runner <- atomically (readTVar runnerTVar)
+         putStrLn "Shutting down the runner"
+         mapM_ interrupt runner
+         exitSuccess)
   exitSuccess
+
+initSession :: TChan LoadingStatus -> IO (IdeSession, UpdateSession, Deps)
+initSession loading =
+  do (session, updateSession) <- startSession loading
+     (hsSourceDirs, _) <- checkCabalFile
+     (_, deps) <- getDeps hsSourceDirs
+     develHsPath <- checkDevelFile
+     content <- LB.readFile develHsPath
+     void (updateSession (updateSourceFile develHsPath content))
+     return (session, updateSession, deps)
 
 runLoop :: RunActions RunResult -> IO ()
 runLoop ra =
-  (let loop = do x <- runWait ra
-                 case x  of
-                   Left status -> Text.putStr (Text.decodeUtf8 status) >> loop
-                   Right RunOk -> putStrLn "Application finished running"
-                   Right (RunProgException ex) -> putStrLn ex
-                   Right (RunGhcException ex) -> putStrLn ex
-                   Right RunForceCancelled -> putStrLn "Force shutdown"
-                   Right RunBreak -> putStrLn "Halting on Breakpoint"
-   in loop) `Ex.finally` (putStrLn "Interrupting runner" >> interrupt ra >> putStrLn "Runner shut down.")
+  let loop = do x <- runWait ra
+                case x  of
+                  Left status -> Text.putStr (Text.decodeUtf8 status) >> loop
+                  Right RunOk -> putStrLn "Application finished running."
+                  Right (RunProgException ex) -> putStrLn ex
+                  Right (RunGhcException ex) -> putStrLn ex
+                  Right RunForceCancelled -> putStrLn "Force shutdown occured."
+                  Right RunBreak -> putStrLn "Halting on Breakpoint."
+   in loop
 
 runDevel :: Options
          -> TVar IdeSession
-         -> TChan LoadingStatus
+         -> TVar Runner
+         -> TMVar RunCommand
          -> IO ()
-runDevel opts sessionTVar loading =
-  do iLastRunLoop <- I.newIORef Nothing
-     Ex.finally (forever $
-                  do loadingStatus <- atomically (readTChan loading)
-                     case loadingStatus of
-                        LoadOK _ ->
-                          do shutdown iLastRunLoop
-                             session <- atomically (readTVar sessionTVar)
-                             ra <- runStmt session "Main" "main"
-                             loop <- async (runLoop ra)
-                             I.writeIORef iLastRunLoop (Just loop)
-                        NotLoading -> return ()
-                        _ ->  shutdown iLastRunLoop >> return ())
-                 (shutdown iLastRunLoop)
-  where shutdown iLastRunLoop =
-          do lastRunLoop <- I.readIORef iLastRunLoop
-             I.writeIORef iLastRunLoop Nothing
-             mapM_ cancel lastRunLoop
+runDevel opts sessionTVar runnerTVar runCommandTMVar =
+  forever $
+    do cmd <- atomically (takeTMVar runCommandTMVar)
+       case cmd of
+          Start ->
+            do session <- atomically (readTVar sessionTVar)
+               ra <- runStmt session "Main" "main"
+               atomically (writeTVar runnerTVar (Just ra))
+               void (async (runLoop ra))
+               return ()
+          Stop ->
+            do runner <- atomically $ do runner <- readTVar runnerTVar
+                                         writeTVar runnerTVar Nothing
+                                         return runner
+               mapM_ interrupt runner
+               return ()
+
+
+
 
 checkDevelFile :: IO String
 checkDevelFile =
     loop paths
   where
     paths = ["app/devel.hs", "devel.hs", "src/devel.hs"]
-
     loop [] = failWith $ "file devel.hs not found, checked: " ++ show paths
     loop (x:xs) = do
         e <- doesFileExist x
         if e
             then return x
             else loop xs
-
-
-
 
 failWith :: String -> IO a
 failWith msg = do
@@ -270,7 +299,7 @@ failWith msg = do
 
 
 updatedDeps :: Deps -> WriterT [String] (StateT (Map.Map String (Set.Set Deref)) IO) ()
-updatedDeps deps = (mapM_ go . Map.toList) deps
+updatedDeps = mapM_ go . Map.toList
   where
     go (x, (ys, ct)) = do
         isChanged <- handle (\(_ :: Ex.SomeException) -> return True) $ lift $
@@ -291,9 +320,7 @@ updatedDeps deps = (mapM_ go . Map.toList) deps
                         _ -> return True
         when isChanged $ forM_ ys $ \y -> do
             n <- liftIO $ x `isNewerThan` y
-            when n $ do
-              -- liftIO $ putStrLn ("Forcing recompile for " ++ y ++ " because of " ++ x)
-              tell [y]
+            when n (tell [y])
 
 isNewerThan :: String -> String -> IO Bool
 isNewerThan f1 f2 = do
