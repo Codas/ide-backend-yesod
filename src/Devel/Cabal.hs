@@ -6,6 +6,12 @@
 
 module Devel.Cabal (startSession
                    ,LoadingStatus(..)
+                   ,StatusMessage(..)
+                   ,StatusMessageType (..)
+                   ,Error(..)
+                   ,Span(..)
+                   ,configure
+                   ,toError
                    ) where
 
 import           Control.Exception
@@ -59,7 +65,7 @@ import           System.Process (ProcessHandle,
 import           Devel.Git
 
 data Target =
-  Target {targetFiles :: !(Set (Loc Relative File))
+  Target {targetFiles :: !(Set (Loc 'Relative 'File))
          ,targetExtensions :: ![Extension]
          ,targetDependencies :: ![PackageName]}
   deriving (Show)
@@ -87,10 +93,15 @@ data LoadingStatus
   | LoadFailed ![Either Text Error]
   deriving (Eq,Show)
 
+data StatusMessageType = SuccessMsg | InfoMsg | WarningMsg | ErrorMsg
+  deriving (Eq,Show)
+data StatusMessage = StatusMessage Text StatusMessageType
+  deriving (Eq,Show)
+
 -- | All exceptions thrown by the library.
 data FPException
   = FPNoCabalFile FilePath
-  | FPInvalidCabalFile (Loc Absolute File) PError
+  | FPInvalidCabalFile (Loc 'Absolute 'File) PError
   deriving (Show,Typeable)
 instance Exception FPException
 
@@ -107,13 +118,12 @@ getCabalFp pkgDir =
 -- | Start the session with the cabal file, will not proceed if the
 -- targets are unambiguous, in which case it will be continued later
 -- after prompting the user.
-startSession :: TVar LoadingStatus -> IO IdeSession
-
+startSession :: TChan LoadingStatus
+             -> IO (IdeSession, IdeSessionUpdate -> IO (Maybe [Either Text Error]))
 startSession loading =
   do dir <- getWorkingDir
      cabalfp <- getCabalFp dir
      target <- getTarget cabalfp
-     datafiles <- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
      configure
      lbi <- getPersistBuildConfig (FP.encodeString (FL.toFilePath dir FP.</> "dist"))
      session <-
@@ -124,14 +134,14 @@ startSession loading =
      loadProject
        session
        target
-       datafiles
-       loading
-     return session
+     let reloadSession extra =
+           do datafiles <- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
+              loadFiles session target datafiles extra loading
+     return (session, reloadSession)
   where sessionParams :: Target -> LocalBuildInfo -> SessionInitParams
         sessionParams target lbi =
           defaultSessionInitParams {sessionInitGhcOptions =
                                       ["-hide-all-packages"] <>
-                                      ["-package", display (packageId (localPkgDescr lbi))] <>
                                       (concatMap includePackage (targetDependencies target))}
           where includePackage pkgName =
                   ["-package",display pkgName]
@@ -364,12 +374,9 @@ flagMap = M.fromList . map pair
 -- | Load the project into the ide-backend.
 loadProject :: IdeSession
             -> Target
-            -> Set FilePath
-            -> TVar LoadingStatus
             -> IO ()
-loadProject session target datafiles loading =
-  void (forkIO (do setOpts session target
-                   loadFiles session target datafiles loading))
+loadProject session target =
+  void (forkIO (setOpts session target))
 
 -- | Set GHC options.
 setOpts  :: IdeSession -> Target ->  IO ()
@@ -388,9 +395,10 @@ setOpts sess target =
 loadFiles :: IdeSession
           -> Target
           -> Set FilePath
-          -> TVar LoadingStatus
-          -> IO ()
-loadFiles sess target files loading =
+          -> IdeSessionUpdate
+          -> TChan LoadingStatus
+          -> IO (Maybe [Either Text Error])
+loadFiles sess target files extra loading =
   do updates <- forM loadedFiles
                      (\fp ->
                         do content <- L.readFile (FL.encodeString fp)
@@ -401,14 +409,13 @@ loadFiles sess target files loading =
                          do content <- L.readFile (FP.encodeString fp)
                             return (updateDataFile (FP.encodeString fp)
                                                    content))
-     atomically (writeTVar loading NotLoading)
+     atomically (writeTChan loading NotLoading)
      updateSession
        sess
-       (mconcat updates <> mconcat updates' <>
-        updateCodeGeneration True)
+       (mconcat updates <> mconcat updates' <> extra <> updateCodeGeneration True)
        (\progress ->
           atomically
-            (writeTVar loading
+            (writeTChan loading
                        (Loading (progressStep progress)
                                 (progressNumSteps progress)
                                 (fromMaybe (fromMaybe "Unknown step" (progressOrigMsg progress))
@@ -416,9 +423,11 @@ loadFiles sess target files loading =
      errs <- fmap (filter isError)
                   (getSourceErrors sess)
      if null errs
-        then atomically
-               (writeTVar loading (LoadOK (map (T.pack . FL.encodeString) (sort loadedFiles))))
-        else atomically (writeTVar loading (LoadFailed (map toError errs)))
+        then do atomically
+                  (writeTChan loading (LoadOK (map (T.pack . FL.encodeString) (sort loadedFiles))))
+                return Nothing
+        else do atomically (writeTChan loading (LoadFailed (map toError errs)))
+                return (Just (map toError errs))
   where loadedFiles = S.toList (targetFiles target)
         isError (SourceError{errorKind = k}) =
           case k of

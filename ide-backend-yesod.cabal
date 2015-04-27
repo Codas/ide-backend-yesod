@@ -11,6 +11,11 @@ category:            Development
 build-type:          Simple
 extra-source-files:  README.md
 cabal-version:       >=1.10
+data-files:          refreshing.html
+                      
+extra-source-files:
+  *.pem
+  *.key
 
 executable ide-backend-yesod
   main-is:             Devel.hs
@@ -34,6 +39,9 @@ executable ide-backend-yesod
 
                      , ide-backend-rts
 
+                     , lifted-base
+                     , attoparsec           >= 0.10
+                     , shakespeare          >= 2.0
                      , monad-loops          >= 0.4.2.1
                      , system-fileio        >= 0.3.14
                      , system-filepath      >= 0.4.12
@@ -44,21 +52,27 @@ executable ide-backend-yesod
                      , data-default-class
                      , streaming-commons
                      , stm
+                     , async
+                     , network
+                     , http-types
+                     , ghc
                      , resourcet
                      , transformers
+                     , file-embed
                      , template-haskell
                      , process
                      , conduit              >= 1.2.0.2
                      , conduit-extra        >= 1.1.4
                      , exceptions           >= 0.6.1
                      , warp-tls             >= 3.0.1
+                     , http-client
                      , http-conduit         >= 2.1.4
                      , http-reverse-proxy   >= 0.4
                      , fsnotify             >= 0.0  && < 0.2
                      , unix-compat          >= 0.2  && < 0.5
   hs-source-dirs:      src
   default-language:    Haskell2010
-  ghc-options:         -Wall
+  ghc-options:         -Wall -threaded
   default-extensions:  NoMonomorphismRestriction
                        RankNTypes
                        RecordWildCards
