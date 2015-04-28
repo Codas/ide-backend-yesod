@@ -20,7 +20,7 @@ getGitFiles :: (MonadThrow m,MonadIO m)
             => m (Set FilePath)
 getGitFiles =
   do (_,ps) <- sourceProcessWithConsumer
-                 (proc "git" ["ls-files"])
+                 (proc "git" ["ls-files", "-o", "--exclude-standard", "-c"])
                  (CT.decodeUtf8 $= CT.lines $= CL.consume)
      return (S.fromList
                (map (FP.decodeString . T.unpack)

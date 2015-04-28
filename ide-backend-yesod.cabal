@@ -22,6 +22,7 @@ executable ide-backend-yesod
   other-modules:       Devel.Cabal
                      , Devel.CmdLine
                      , Devel.Git
+                     , Devel.Deps
                      , Filesystem.Path.Find
                      , Filesystem.Loc
   build-depends:       base                 >= 4.5  && < 5
@@ -51,6 +52,7 @@ executable ide-backend-yesod
                      , wai-extra
                      , data-default-class
                      , streaming-commons
+                     , filemanip
                      , stm
                      , async
                      , network

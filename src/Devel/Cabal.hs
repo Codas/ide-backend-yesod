@@ -6,8 +6,6 @@
 
 module Devel.Cabal (startSession
                    ,LoadingStatus(..)
-                   ,StatusMessage(..)
-                   ,StatusMessageType (..)
                    ,Error(..)
                    ,Span(..)
                    ,configure
@@ -91,11 +89,6 @@ data LoadingStatus
   | Loading !Int !Int !Text
   | LoadOK ![Text]
   | LoadFailed ![Either Text Error]
-  deriving (Eq,Show)
-
-data StatusMessageType = SuccessMsg | InfoMsg | WarningMsg | ErrorMsg
-  deriving (Eq,Show)
-data StatusMessage = StatusMessage Text StatusMessageType
   deriving (Eq,Show)
 
 -- | All exceptions thrown by the library.
