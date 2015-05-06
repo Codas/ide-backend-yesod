@@ -180,16 +180,24 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
                       atomically $ do writeTVar sessionTVar newSession
                                       writeTVar updateSessionTVar newUpdateSession
                                       writeTVar depsTVar newDeps
-                      updateFile mempty
+                      develHsPath <- checkDevelFile
+                      void (newUpdateSession (updateSourceFileFromFile develHsPath))
                       atomically (putTMVar runCommandTMVar Start)
   where getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
         updateFile :: IdeSessionUpdate -> IO ()
         updateFile upd =
           do develHsPath <- checkDevelFile
+             putStrLn "[Restarting Runner] Closing"
              atomically (putTMVar runCommandTMVar Stop)
+             putStrLn "[Restarting Runner] Updating"
              updateSession <- atomically (readTVar updateSessionTVar)
              void (updateSession (upd <> updateSourceFileFromFile develHsPath))
+             putStrLn "[Restarting Runner] Updated"
              atomically (putTMVar runCommandTMVar Start)
+             putStrLn "[Restarting Runner] Starting"
+             (hsSourceDirs, _) <- checkCabalFile
+             (_, newDeps) <- getDeps hsSourceDirs
+             atomically (writeTVar depsTVar newDeps)
 
 main :: IO ()
 main = do
@@ -249,7 +257,7 @@ runDevel opts sessionTVar runnerTVar runCommandTMVar =
        case cmd of
           Start ->
             do session <- atomically (readTVar sessionTVar)
-               ra <- runStmt session "Main" "main"
+               ra <- runStmt session "Application" "develMain"
                atomically (writeTVar runnerTVar (Just ra))
                void (async (runLoop ra))
                return ()
@@ -266,7 +274,7 @@ checkDevelFile :: IO String
 checkDevelFile =
     loop paths
   where
-    paths = ["app/devel.hs", "devel.hs", "src/devel.hs"]
+    paths = ["Application.hs" {- , "app/devel.hs", "devel.hs", "src/devel.hs" -}]
     loop [] = failWith $ "file devel.hs not found, checked: " <> show paths
     loop (x:xs) = do
         e <- doesFileExist x
