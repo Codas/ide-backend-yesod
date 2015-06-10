@@ -6,10 +6,7 @@ packages:
 - '../ide-backend/ide-backend-rts'
 - '../ide-backend/ide-backend-server'
 - '../ide-backend/ide-backend-common'
-- '../cabal/Cabal'
-- '../cabal/cabal-install'
 extra-deps:
 - hfsevents-0.1.5
-- Cabal-1.22.2
-- cabal-install-1.22.2
+- Cabal-1.22.3.0
 resolver: nightly-2015-06-08
