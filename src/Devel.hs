@@ -115,7 +115,7 @@ shouldReload dir event = not (or conditions)
                 Left filePath -> filePath
                 Right filePath -> filePath
         conditions = [ notInPath ".git", notInPath "yesod-devel", notInPath "dist"
-                     , notInPath "session.", notInFile ".tmp"
+                     , notInPath "session.", notInFile ".tmp", notInPath "scss"
                      , notInFile "#", notInPath ".cabal-sandbox", notInFile "flycheck_"]
         notInPath t = t `Text.isInfixOf` stripPrefix dir p
         notInFile t = t `Text.isInfixOf` fn

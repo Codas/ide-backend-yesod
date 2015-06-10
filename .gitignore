@@ -4,3 +4,5 @@ tags
 cabal.config
 cabal.sandbox.config
 session.*/
+.stack-work/
+dist-stack/

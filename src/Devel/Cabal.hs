@@ -52,6 +52,7 @@ import qualified Filesystem.Path.CurrentOS as FP
 import           IdeSession hiding (errorSpan,errorMsg)
 import           Language.Haskell.Extension
 import           Prelude hiding (FilePath,writeFile,pi)
+import           System.Environment (lookupEnv, unsetEnv)
 import           System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import           System.Process (ProcessHandle,
                                  createProcess, env,
@@ -107,6 +108,16 @@ getCabalFp pkgDir =
      case mcabal of
        Nothing -> throwIO (FPNoCabalFile (FL.toFilePath pkgDir))
        Just cabalfp -> return cabalfp
+                              
+-- TODO: fix hardcoded sources...
+stackDir :: FilePath
+stackDir = "dist-stack" FP.</> "x86_64-osx" FP.</> "Cabal-1.22.2.0"
+
+stackBuildDir :: FilePath
+stackBuildDir = stackDir FP.</> "build"
+
+stackAutogenDir :: FilePath
+stackAutogenDir = stackBuildDir FP.</> "autogen"
 
 -- | Start the session with the cabal file, will not proceed if the
 -- targets are unambiguous, in which case it will be continued later
@@ -114,16 +125,25 @@ getCabalFp pkgDir =
 startSession :: TChan LoadingStatus
              -> IO (IdeSession, IdeSessionUpdate -> IO (Maybe [Either Text Error]))
 startSession loading =
-  do dir <- getWorkingDir
+  do env <- lookupEnv "GHC_PACKAGE_PATH"
+     -- extraPackageDBs <- case env of
+     --                      Nothing -> return []
+     --                      Just packageDBs ->
+     --                        do unsetEnv "GHC_PACKAGE_PATH"
+     --                           return $ fmap SpecificPackageDB (splitColon packageDBs)
+     dir <- getWorkingDir
      cabalfp <- getCabalFp dir
      target <- getTarget cabalfp
      configure
      lbi <- getPersistBuildConfig (FP.encodeString (FL.toFilePath dir FP.</> "dist"))
+     -- lbi' <- getPersistBuildConfig (FP.encodeString (FL.toFilePath dir FP.</> stackDir))
+     -- let lbi = lbi' {buildDir = FP.encodeString stackBuildDir}
+     -- let packageDBs = GlobalPackageDB : reverse (init extraPackageDBs)
      session <-
        initSession (sessionParams target lbi)
-                   defaultSessionConfig {
-                     configPackageDBStack = map translatePackageDB (withPackageDB lbi)
-                   }
+                   defaultSessionConfig {configPackageDBStack = map translatePackageDB (withPackageDB lbi)
+                                        -- ,configLocalWorkingDir = Just (FL.encodeString dir)
+                                        }
      loadProject
        session
        target
@@ -131,7 +151,11 @@ startSession loading =
            do datafiles <- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
               loadFiles session target datafiles extra loading
      return (session, reloadSession)
-  where sessionParams :: Target -> LocalBuildInfo -> SessionInitParams
+  where -- splitColon s = case dropWhile (== ':') s of
+        --                  "" -> []
+        --                  s' -> w : splitColon s''
+        --                    where (w, s'') = break (== ':') s'
+        sessionParams :: Target -> LocalBuildInfo -> SessionInitParams
         sessionParams target lbi =
           defaultSessionInitParams {sessionInitGhcOptions =
                                       ["-hide-all-packages"] <>
@@ -202,7 +226,7 @@ haskellFileExts = ["hs","hsc","lhs"]
 
 -- | Default src dirs for Cabal targets.
 defaultSrcDirs :: [String]
-defaultSrcDirs = ["","dist/build/autogen"]
+defaultSrcDirs = ["", FP.encodeString ("dist" FP.</> "build" FP.</> "autogen")]
 
 -- | Try to resolve the list of base names in the given directory by
 -- looking for unique instances of base names applied with the given
@@ -403,6 +427,7 @@ loadFiles sess target files extra loading =
                             return (updateDataFile (FP.encodeString fp)
                                                    content))
      atomically (writeTChan loading NotLoading)
+     putStrLn  "Updating done"
      updateSession
        sess
        (mconcat updates <> mconcat updates' <> extra <> updateCodeGeneration True)
@@ -415,11 +440,14 @@ loadFiles sess target files extra loading =
                                            (progressParsedMsg progress)))))
      errs <- fmap (filter isError)
                   (getSourceErrors sess)
+     putStrLn  "Updates done"
      if null errs
-        then do atomically
-                  (writeTChan loading (LoadOK (map (T.pack . FL.encodeString) (sort loadedFiles))))
+        then do atomically (writeTChan loading (LoadOK (map (T.pack . FL.encodeString) (sort loadedFiles))))
+                putStrLn "No erros"
                 return Nothing
         else do atomically (writeTChan loading (LoadFailed (map toError errs)))
+                putStrLn "Some errors"
+                print (map toError errs)
                 return (Just (map toError errs))
   where loadedFiles = S.toList (targetFiles target)
         isError (SourceError{errorKind = k}) =
