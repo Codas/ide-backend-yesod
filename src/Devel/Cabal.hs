@@ -54,6 +54,7 @@ import           Language.Haskell.Extension
 import           Prelude hiding (FilePath,writeFile,pi)
 import           System.Environment (lookupEnv, unsetEnv)
 import           System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import           System.Directory (getCurrentDirectory)
 import           System.Process (ProcessHandle,
                                  createProcess, env,
                                  getProcessExitCode,
@@ -132,6 +133,7 @@ startSession loading =
      --                        do unsetEnv "GHC_PACKAGE_PATH"
      --                           return $ fmap SpecificPackageDB (splitColon packageDBs)
      dir <- getWorkingDir
+     dirStr <- getCurrentDirectory
      cabalfp <- getCabalFp dir
      target <- getTarget cabalfp
      configure
@@ -142,6 +144,7 @@ startSession loading =
      session <-
        initSession (sessionParams target lbi)
                    defaultSessionConfig {configPackageDBStack = map translatePackageDB (withPackageDB lbi)
+                                        ,configGenerateModInfo = False
                                         -- ,configLocalWorkingDir = Just (FL.encodeString dir)
                                         }
      loadProject
@@ -181,6 +184,7 @@ configure =
                                  , "-flibrary-only"
                                  , "--disable-tests"
                                  , "--disable-benchmarks"
+                                 , "-fdev"
                                  , "-fdevel"
                                  , "--disable-library-profiling"
                                  ]
@@ -399,9 +403,10 @@ loadProject session target =
 setOpts  :: IdeSession -> Target ->  IO ()
 setOpts sess target =
   updateSession sess
-                (updateGhcOpts (map showExt (targetExtensions target)))
+                (updateGhcOpts opts) 
                 (const (return ()))
-  where showExt :: Extension -> String
+  where opts = (map showExt (targetExtensions target)) <> ["-optP-DDEVELOPMENT"]
+        showExt :: Extension -> String
         showExt g =
           case g of
             EnableExtension e -> "-X" <> show e
@@ -416,16 +421,17 @@ loadFiles :: IdeSession
           -> TChan LoadingStatus
           -> IO (Maybe [Either Text Error])
 loadFiles sess target files extra loading =
-  do updates <- forM loadedFiles
+  do dir <- getCurrentDirectory
+     updates <- forM loadedFiles
                      (\fp ->
                         do content <- L.readFile (FL.encodeString fp)
-                           return (updateSourceFile (FL.encodeString fp)
-                                                    content))
+                           let sFp =  justStripPrefix (dir <> "/") (FL.encodeString fp)
+                           return (updateSourceFile sFp content))
      updates' <- forM (S.toList files)
                       (\fp ->
                          do content <- L.readFile (FP.encodeString fp)
-                            return (updateDataFile (FP.encodeString fp)
-                                                   content))
+                            let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
+                            return (updateDataFile sFp content))
      atomically (writeTChan loading NotLoading)
      putStrLn  "Updating done"
      updateSession
@@ -450,6 +456,7 @@ loadFiles sess target files extra loading =
                 print (map toError errs)
                 return (Just (map toError errs))
   where loadedFiles = S.toList (targetFiles target)
+        justStripPrefix p s = fromMaybe s (stripPrefix p s)
         isError (SourceError{errorKind = k}) =
           case k of
             KindError -> True

@@ -26,8 +26,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
 import qualified Data.Text.IO as Text
-import           Filesystem.Path.CurrentOS (toText, filename, extension)
-import           Filesystem.Path (FilePath, )
+import           Filesystem.Path.CurrentOS (fromText, toText, filename, extension)
+import           Filesystem.Path (FilePath)
 import qualified Filesystem as FS
 import           Network (withSocketsDo)
 import           Network.HTTP.Client (managerSetProxy, noProxy)
@@ -49,19 +49,19 @@ import           System.Exit ( ExitCode (..)
                              , exitFailure
                              , exitSuccess)
 import           System.FSNotify
-import           IdeSession hiding (updateSession, initSession)
+import           IdeSession hiding (initSession)
 
 import           Devel.Cabal
 import           Devel.CmdLine
 import           Devel.Deps
 
-type UpdateSession = IdeSessionUpdate -> IO (Maybe [Either Text Error])
+type UpdateSessionFn = IdeSessionUpdate -> IO (Maybe [Either Text Error])
 type Runner = Maybe (RunActions RunResult)
 
 data FileChangeType = FileAdded | FileModified | FileRemoved
     deriving (Show, Eq)
 
-data FileType = HaskellFile | DataFile | CabalFile
+data FileType = HaskellFile | DataFile | StaticFile | CabalFile
     deriving (Show, Eq)
 
 data FileChange = FileChange
@@ -74,33 +74,38 @@ data RunCommand = Start | Stop
 
 watchThread :: TChan FileChange -> IO ()
 watchThread writeChan = withManager (\mgr ->
-  do dir <- fmap (either id id . toText) FS.getWorkingDirectory
+  do dir <- fmap fpToText FS.getWorkingDirectory
+     let isStaticFile fp = "/static/" `Text.isPrefixOf` stripPrefix dir (fpToText fp)
+         toFileChange event =
+           let stringPath = fpToString filePath
+               fpToString = Text.unpack . stripPrefix (dir <> "/") . either id id . toText
+               filePath = eventPath event
+               fileType = whichFileType filePath
+               fileChangeType =
+                 case event of
+                   Added _ _    -> FileAdded
+                   Removed _ _  -> FileRemoved
+                   Modified _ _ -> FileModified
+           in FileChange stringPath fileChangeType fileType
+         whichFileType filePath
+           | isHsFile     filePath = HaskellFile
+           | isCabalFile  filePath = CabalFile
+           | isStaticFile filePath = StaticFile
+           | otherwise             = DataFile
      _ <- watchTree mgr                 -- manager
                     "."                 -- directory to watch
                     (shouldReload dir)  -- predicate
                     (atomically . writeTChan writeChan . toFileChange)
      -- sleep forever (until interrupted)
      forever $ threadDelay (1000 * 1000 * 10))
-  where toFileChange event =
-          let stringPath = fpToString filePath
-              filePath = eventPath event
-              fileType = whichFileType filePath
-              fileChangeType =
-                case event of
-                  Added _ _    -> FileAdded
-                  Removed _ _  -> FileRemoved
-                  Modified _ _ -> FileModified
-          in FileChange stringPath fileChangeType fileType
-        whichFileType filePath
-          | isHsFile    filePath = HaskellFile
-          | isCabalFile filePath = CabalFile
-          | otherwise            = DataFile
+  where mgrConfig = defaultConfig {confDebounce = Debounce 0.2}
         isHsFile :: FilePath -> Bool
         isHsFile fp = any (`elem` extension fp) haskellFileExts
         isCabalFile fp = filename fp == "cabal.sandbox.config" || "cabal" `elem` extension fp
         haskellFileExts :: [Text]
         haskellFileExts = ["hs","hsc","lhs"]
-        fpToString = Text.unpack . either id id . toText
+        fpToText = either id id . toText
+        stripPrefix pre t = fromMaybe t (Text.stripPrefix pre t)
 
 shouldReload :: Text -> Event -> Bool
 shouldReload dir event = not (or conditions)
@@ -108,18 +113,18 @@ shouldReload dir event = not (or conditions)
               Added filePath _ -> filePath
               Modified filePath _ -> filePath
               Removed filePath _ -> filePath
-        p = case toText fp of
-              Left filePath -> filePath
-              Right filePath -> filePath
-        fn = case toText (filename fp) of
-                Left filePath -> filePath
-                Right filePath -> filePath
-        conditions = [ notInPath ".git", notInPath "yesod-devel", notInPath "dist"
-                     , notInPath "session.", notInFile ".tmp", notInPath "scss"
-                     , notInFile "#", notInPath ".cabal-sandbox", notInFile "flycheck_"]
-        notInPath t = t `Text.isInfixOf` stripPrefix dir p
-        notInFile t = t `Text.isInfixOf` fn
+        p = fpToText fp
+        fn = fpToText (filename fp)
+        modified = case event of
+                     Modified _ _ -> True
+                     _        -> False
+        conditions = [ inPath ".git", inPath "yesod-devel", inPath "dist"
+                     , inPath "session.", inFile ".tmp", inPath "scss"
+                     , inFile "#", inPath ".cabal-sandbox", inFile "flycheck_"]
+        inPath t = t `Text.isInfixOf` stripPrefix dir p
+        inFile t = t `Text.isInfixOf` fn
         stripPrefix pre t = fromMaybe t (Text.stripPrefix pre t)
+        fpToText = either id id . toText
 
 handleStatusUpdates :: TChan LoadingStatus -> IO ()
 handleStatusUpdates loading' =
@@ -143,10 +148,10 @@ handleFilesChanged :: TChan FileChange
                    -> TVar Deps
                    -> TVar IdeSession
                    -> TMVar RunCommand
-                   -> TVar UpdateSession
+                   -> TVar UpdateSessionFn
                    -> TChan LoadingStatus
                    -> IO ()
-handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSessionTVar loading =
+handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSessionFnTVar loading =
   do filesChanged <- atomically (dupTChan filesChanged')
      lastChangedFileRef <- I.newIORef Nothing
      forever $
@@ -156,7 +161,8 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
           lastChangedFile <- I.readIORef lastChangedFileRef
           content <- if not exists
                         then return ""
-                        else LB.readFile filePath
+                        else do putStrLn $ "reading filepath: " <> filePath
+                                LB.readFile filePath
           I.writeIORef lastChangedFileRef (Just (filePath, content))
           unless (lastChangedFile == Just (filePath, content)) $
             do deps <- atomically (readTVar depsTVar)
@@ -167,31 +173,37 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
                case (fileChangeType, fileType) of
                  (FileAdded,    HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
                  (FileAdded,    DataFile)    -> updateFile (updateDataFile filePath content <> extra)
+                 (FileAdded,    StaticFile)  -> updateFile (updateDataFile filePath content <> extra)
                  (FileModified, HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
                  (FileModified, DataFile)    -> updateFile (updateDataFile filePath content <> extra)
+                 (FileModified, StaticFile)  -> updateStaticFile (updateDataFile filePath content)
                  (FileRemoved,  HaskellFile) -> updateFile (updateSourceFileDelete filePath)
                  (FileRemoved,  DataFile)    -> updateFile (updateDataFileDelete filePath)
+                 (FileRemoved,  StaticFile)  -> updateFile (updateDataFileDelete filePath)
                  (_,            CabalFile)   ->
                    do putStrLn "Cabal file changed. Reloading session."
                       atomically (putTMVar runCommandTMVar Stop)
                       session <- atomically (readTVar sessionTVar)
                       shutdownSession session
-                      (newSession, newUpdateSession, newDeps) <- initSession loading
+                      (newSession, newUpdateSessionFn, newDeps) <- initSession loading
                       atomically $ do writeTVar sessionTVar newSession
-                                      writeTVar updateSessionTVar newUpdateSession
+                                      writeTVar updateSessionFnTVar newUpdateSessionFn
                                       writeTVar depsTVar newDeps
                       develHsPath <- checkDevelFile
-                      void (newUpdateSession (updateSourceFileFromFile develHsPath))
+                      void (newUpdateSessionFn (updateSourceFileFromFile develHsPath))
                       atomically (putTMVar runCommandTMVar Start)
   where getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
+        updateStaticFile :: IdeSessionUpdate -> IO ()
+        updateStaticFile upd = do session <- atomically (readTVar sessionTVar)
+                                  updateSession session upd print
         updateFile :: IdeSessionUpdate -> IO ()
         updateFile upd =
           do develHsPath <- checkDevelFile
              putStrLn "[Restarting Runner] Closing"
              atomically (putTMVar runCommandTMVar Stop)
              putStrLn "[Restarting Runner] Updating"
-             updateSession <- atomically (readTVar updateSessionTVar)
-             void (updateSession (upd <> updateSourceFileFromFile develHsPath))
+             updateSessionFn <- atomically (readTVar updateSessionFnTVar)
+             void (updateSessionFn (upd <> updateSourceFileFromFile develHsPath))
              putStrLn "[Restarting Runner] Updated"
              atomically (putTMVar runCommandTMVar Start)
              putStrLn "[Restarting Runner] Starting"
@@ -204,19 +216,19 @@ main = do
   opts@Options{..} <- getCommandLineOptions
   loading <- newTChanIO
   filesChanged <- newTChanIO
-  (session, updateSession, deps) <- initSession loading
+  (session, updateSessionFn, deps) <- initSession loading
   depsTVar <- newTVarIO deps
-  updateSessionTVar <- newTVarIO updateSession
+  updateSessionFnTVar <- newTVarIO updateSessionFn
   sessionTVar <- newTVarIO session
   runnerTVar <- newTVarIO Nothing
   runCommandTMVar <- newEmptyTMVarIO
   Ex.finally
     (do _ <- async (runDevel opts sessionTVar runnerTVar runCommandTMVar)
         _ <- async (watchThread filesChanged)
-        _ <- async (handleFilesChanged filesChanged depsTVar sessionTVar runCommandTMVar updateSessionTVar loading)
+        _ <- async (handleFilesChanged filesChanged depsTVar sessionTVar runCommandTMVar updateSessionFnTVar loading)
         _ <- async (handleStatusUpdates loading)
         develHsPath <- checkDevelFile
-        void $ updateSession (updateSourceFileFromFile develHsPath)
+        void $ updateSessionFn (updateSourceFileFromFile develHsPath)
         atomically (putTMVar runCommandTMVar Start)
         threadDelay (1000 * 1000 * 60 * 60 * 24 * 365))  -- run devel server for up to one year
     (do runner <- atomically (readTVar runnerTVar)
@@ -227,12 +239,12 @@ main = do
         exitSuccess)
   exitSuccess
 
-initSession :: TChan LoadingStatus -> IO (IdeSession, UpdateSession, Deps)
+initSession :: TChan LoadingStatus -> IO (IdeSession, UpdateSessionFn, Deps)
 initSession loading =
-  do (session, updateSession) <- startSession loading
+  do (session, updateSessionFn) <- startSession loading
      (hsSourceDirs, _) <- checkCabalFile
      (_, deps) <- getDeps hsSourceDirs
-     return (session, updateSession, deps)
+     return (session, updateSessionFn, deps)
 
 runLoop :: RunActions RunResult -> IO ()
 runLoop ra =
