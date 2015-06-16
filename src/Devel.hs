@@ -229,7 +229,9 @@ main = do
         _ <- async (handleStatusUpdates loading)
         develHsPath <- checkDevelFile
         void $ updateSessionFn (updateSourceFileFromFile develHsPath)
+        putStrLn "[MAIN] Sending initial run command"
         atomically (putTMVar runCommandTMVar Start)
+        putStrLn "[MAIN] Initial run command sent"
         threadDelay (1000 * 1000 * 60 * 60 * 24 * 365))  -- run devel server for up to one year
     (do runner <- atomically (readTVar runnerTVar)
         putStrLn "Shutting down the runner"
@@ -269,9 +271,11 @@ runDevel opts sessionTVar runnerTVar runCommandTMVar =
        case cmd of
           Start ->
             do session <- atomically (readTVar sessionTVar)
-               ra <- runStmt session "Application" "develMain"
-               atomically (writeTVar runnerTVar (Just ra))
-               void (async (runLoop ra))
+               errs <- getSourceErrors session
+               when (null errs)
+                    (do ra <- runStmt session "Application" "develMain"
+                        atomically (writeTVar runnerTVar (Just ra))
+                        void (async (runLoop ra)))
                return ()
           Stop ->
             do runner <- atomically $ do runner <- readTVar runnerTVar
