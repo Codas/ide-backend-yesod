@@ -19,6 +19,7 @@ import           Control.Concurrent.STM
 import           Control.Monad
 import           Control.Monad.Loops (firstM)
 import qualified Data.ByteString.Lazy as L
+import qualified Data.ByteString as SB
 import           Data.Char (isLetter, isDigit)
 import           Data.List
 import           Data.Map.Strict (Map)
@@ -424,14 +425,14 @@ loadFiles sess target files extra loading =
   do dir <- getCurrentDirectory
      updates <- forM loadedFiles
                      (\fp ->
-                        do content <- L.readFile (FL.encodeString fp)
+                        do content <- SB.readFile (FL.encodeString fp)
                            let sFp =  justStripPrefix (dir <> "/") (FL.encodeString fp)
-                           return (updateSourceFile sFp content))
+                           return (updateSourceFile sFp (L.fromStrict content)))
      updates' <- forM (S.toList files)
                       (\fp ->
-                         do content <- L.readFile (FP.encodeString fp)
+                         do content <- SB.readFile (FP.encodeString fp)
                             let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
-                            return (updateDataFile sFp content))
+                            return (updateDataFile sFp (L.fromStrict content)))
      atomically (writeTChan loading NotLoading)
      putStrLn  "Updating done"
      updateSession

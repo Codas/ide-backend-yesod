@@ -14,6 +14,7 @@ import           Control.Monad.Trans.State (StateT, get, put, runStateT)
 import           Control.Monad.Trans.Writer (WriterT, tell, execWriterT)
 import           Control.Monad.Trans.Class (lift)
 import qualified Data.ByteString.Lazy as LB
+import qualified Data.ByteString as SB
 import           Data.Default.Class (def)
 import           Data.FileEmbed (embedFile)
 import           Data.Function
@@ -162,7 +163,7 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
           content <- if not exists
                         then return ""
                         else do putStrLn $ "reading filepath: " <> filePath
-                                LB.readFile filePath
+                                fmap LB.fromStrict (SB.readFile filePath)
           I.writeIORef lastChangedFileRef (Just (filePath, content))
           unless (lastChangedFile == Just (filePath, content)) $
             do deps <- atomically (readTVar depsTVar)
