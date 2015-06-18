@@ -6,7 +6,6 @@ packages:
 - '../ide-backend/ide-backend-rts'
 - '../ide-backend/ide-backend-server'
 - '../ide-backend/ide-backend-common'
-- '../ide-backend-client'
 extra-deps:
 - hfsevents-0.1.5
 - Cabal-1.22.3.0
