@@ -21,6 +21,7 @@ import           Data.Function
 import qualified Data.IORef as I
 import           Data.Maybe
 import           Data.Monoid
+import           Data.List (foldl', intersperse)
 import           Data.Streaming.Network (bindPortTCP)
 import           Data.Text (Text)
 import qualified Data.Text as Text
@@ -31,14 +32,14 @@ import           Filesystem.Path.CurrentOS (fromText, toText, filename, extensio
 import           Filesystem.Path (FilePath)
 import qualified Filesystem as FS
 import           Network (withSocketsDo)
-import           Network.HTTP.Client (managerSetProxy, noProxy)
+import           Network.HTTP.Client (newManager, defaultManagerSettings, managerSetProxy, noProxy)
 import           Network.HTTP.Conduit (conduitManagerSettings, newManager)
-import           Network.HTTP.ReverseProxy             (ProxyDest (ProxyDest),
-                                                        waiProxyToSettings, wpsTimeout, wpsOnExc)
-import qualified Network.HTTP.ReverseProxy as ReverseProxy
-import           Network.HTTP.Types (status200, status503)
+import           Network.HTTP.ReverseProxy (WaiProxyResponse (WPRProxyDest)
+                                           ,ProxyDest (ProxyDest), waiProxyTo, wpsTimeout
+                                           ,waiProxyToSettings, defaultOnExc, wpsOnExc)
+import           Network.HTTP.Types (status200, status502)
 import           Network.Socket (sClose)
-import           Network.Wai (responseLBS, requestHeaders)
+import           Network.Wai (Application, responseLBS, requestHeaders)
 import           Network.Wai.Handler.Warp (run, defaultSettings, setPort)
 import           Network.Wai.Handler.WarpTLS (runTLS, tlsSettingsMemory)
 import           Network.Wai.Parse (parseHttpAccept)
@@ -50,6 +51,7 @@ import           System.Exit ( ExitCode (..)
                              , exitFailure
                              , exitSuccess)
 import           System.FSNotify
+import           System.Environment (setEnv)
 import           IdeSession hiding (initSession)
 
 import           Devel.Cabal
@@ -127,23 +129,26 @@ shouldReload dir event = not (or conditions)
         stripPrefix pre t = fromMaybe t (Text.stripPrefix pre t)
         fpToText = either id id . toText
 
-handleStatusUpdates :: TChan LoadingStatus -> IO ()
-handleStatusUpdates loading' =
+handleStatusUpdates :: TChan LoadingStatus -> TVar Text -> IO ()
+handleStatusUpdates loading' loadingText =
   do loading <- atomically (dupTChan loading')
      forever $
        do status <- atomically $ readTChan loading
           case status of
-            NotLoading -> Text.putStrLn "Currently not loading"
-            LoadOK _ -> Text.putStrLn "Loading complete"
-            LoadFailed msgs -> mapM_ (either Text.putStrLn printError) msgs
-              where printError Error{..} =
-                      do Text.putStrLn errorMsg
-                         let locS = Text.pack ("(" <> show (spanSL errorSpan) <> "," <> show (spanSC errorSpan) <> ")")
-                             locE = Text.pack ("(" <> show (spanEL errorSpan) <> "," <> show (spanEC errorSpan) <> ")")
-                         Text.putStrLn $ "    Occured in " <> errorFile <> ":" <> locS <> "-" <> locE
+            NotLoading -> setLoadingText "Currently not loading"
+            LoadOK _ -> setLoadingText "Loading complete"
+            LoadFailed msgs -> setLoadingText $ foldl' mappend "" $ intersperse "\n" $ map (either id errorToText) msgs
+              where errorToText Error{..} =
+                      let locS = Text.pack ("(" <> show (spanSL errorSpan) <> "," <> show (spanSC errorSpan) <> ")")
+                          locE = Text.pack ("(" <> show (spanEL errorSpan) <> "," <> show (spanEC errorSpan) <> ")")
+                      in errorMsg <> "\n    Occured in " <> errorFile <> ":" <> locS <> "-" <> locE
             Loading step steps msg ->
               do let stepReport = mconcat ["[", show step, " of ", show steps, "] "]
-                 Text.putStrLn (Text.pack stepReport <> msg)
+                 appendLoadingText (Text.pack stepReport <> msg)
+  where setLoadingText t = do Text.putStrLn t
+                              atomically $ writeTVar loadingText t
+        appendLoadingText t = do Text.putStrLn t
+                                 atomically $ modifyTVar loadingText ((t <> "\n") `Text.append`)
 
 handleFilesChanged :: TChan FileChange
                    -> TVar Deps
@@ -205,7 +210,6 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
              putStrLn "[Restarting Runner] Updating"
              updateSessionFn <- atomically (readTVar updateSessionFnTVar)
              void (updateSessionFn (upd <> updateSourceFileFromFile develHsPath))
-             putStrLn "[Restarting Runner] Updated"
              atomically (putTMVar runCommandTMVar Start)
              putStrLn "[Restarting Runner] Starting"
              (hsSourceDirs, _) <- checkCabalFile
@@ -215,7 +219,10 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
 main :: IO ()
 main = do
   opts@Options{..} <- getCommandLineOptions
+  setEnv "PORT" "3001"
+  setEnv "DISPLAY_PORT" "3000"
   loading <- newTChanIO
+  loadingText <- newTVarIO ""
   filesChanged <- newTChanIO
   (session, updateSessionFn, deps) <- initSession loading
   depsTVar <- newTVarIO deps
@@ -224,10 +231,11 @@ main = do
   runnerTVar <- newTVarIO Nothing
   runCommandTMVar <- newEmptyTMVarIO
   Ex.finally
-    (do _ <- async (runDevel opts sessionTVar runnerTVar runCommandTMVar)
+    (do _ <- async (runServer loadingText)
+        _ <- async (runDevel opts sessionTVar runnerTVar runCommandTMVar)
         _ <- async (watchThread filesChanged)
         _ <- async (handleFilesChanged filesChanged depsTVar sessionTVar runCommandTMVar updateSessionFnTVar loading)
-        _ <- async (handleStatusUpdates loading)
+        _ <- async (handleStatusUpdates loading loadingText)
         develHsPath <- checkDevelFile
         void $ updateSessionFn (updateSourceFileFromFile develHsPath)
         putStrLn "[MAIN] Sending initial run command"
@@ -241,6 +249,25 @@ main = do
         shutdownSession session'
         exitSuccess)
   exitSuccess
+
+reverseProxy :: TVar Text -> IO Application
+reverseProxy loadingText = do
+  mgr <- newManager defaultManagerSettings
+  return $ waiProxyTo
+         (const $ return $ WPRProxyDest $ ProxyDest "localhost" 3001)
+         showStatus
+         mgr
+  where showStatus exc _ sendResponse =
+          do status <- atomically $ readTVar loadingText
+             sendResponse $ responseLBS
+                            status502
+                            [("content-type", "text/plain")]
+                            (LB.fromStrict (Text.encodeUtf8 status))
+
+runServer :: TVar Text -> IO ()
+runServer loadingText = do
+  appl <- reverseProxy loadingText
+  run 3000 appl
 
 initSession :: TChan LoadingStatus -> IO (IdeSession, UpdateSessionFn, Deps)
 initSession loading =

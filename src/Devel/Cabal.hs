@@ -406,7 +406,7 @@ setOpts sess target =
   updateSession sess
                 (updateGhcOpts opts) 
                 (const (return ()))
-  where opts = (map showExt (targetExtensions target)) <> ["-optP-DDEVELOPMENT"]
+  where opts = map showExt (targetExtensions target) <> ["-optP-DDEVELOPMENT"]
         showExt :: Extension -> String
         showExt g =
           case g of
@@ -434,7 +434,6 @@ loadFiles sess target files extra loading =
                             let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
                             return (updateDataFile sFp (L.fromStrict content)))
      atomically (writeTChan loading NotLoading)
-     putStrLn  "Updating done"
      updateSession
        sess
        (mconcat updates <> mconcat updates' <> extra <> updateCodeGeneration True)
@@ -450,11 +449,8 @@ loadFiles sess target files extra loading =
      putStrLn  "Updates done"
      if null errs
         then do atomically (writeTChan loading (LoadOK (map (T.pack . FL.encodeString) (sort loadedFiles))))
-                putStrLn "No erros"
                 return Nothing
         else do atomically (writeTChan loading (LoadFailed (map toError errs)))
-                putStrLn "Some errors"
-                print (map toError errs)
                 return (Just (map toError errs))
   where loadedFiles = S.toList (targetFiles target)
         justStripPrefix p s = fromMaybe s (stripPrefix p s)
