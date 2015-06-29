@@ -300,10 +300,11 @@ runDevel opts sessionTVar runnerTVar runCommandTMVar =
           Start ->
             do session <- atomically (readTVar sessionTVar)
                errs <- getSourceErrors session
-               when (null errs)
-                    (do ra <- runStmt session "Application" "develMain"
-                        atomically (writeTVar runnerTVar (Just ra))
-                        void (async (runLoop ra)))
+               when (any isError errs) (putStrLn ("[RUN DEVEL] " ++ show errs))
+               unless (any isError errs)
+                      (do ra <- runStmt session "Application" "develMain"
+                          atomically (writeTVar runnerTVar (Just ra))
+                          void (async (runLoop ra)))
                return ()
           Stop ->
             do runner <- atomically $ do runner <- readTVar runnerTVar
@@ -311,6 +312,11 @@ runDevel opts sessionTVar runnerTVar runCommandTMVar =
                                          return runner
                mapM_ interrupt runner
                return ()
+  where isError (SourceError{errorKind = k}) =
+          case k of
+            KindError -> True
+            KindServerDied -> True
+            KindWarning -> False
 
 
 
