@@ -22,6 +22,7 @@ import qualified Data.IORef as I
 import           Data.Maybe
 import           Data.Monoid
 import           Data.List (foldl', intersperse)
+import qualified Data.Set as Set
 import           Data.Streaming.Network (bindPortTCP)
 import           Data.Text (Text)
 import qualified Data.Text as Text
@@ -52,7 +53,10 @@ import           System.Exit ( ExitCode (..)
                              , exitSuccess)
 import           System.FSNotify
 import           System.Environment (setEnv)
-import           IdeSession hiding (initSession)
+import           System.PosixCompat.Files (touchFile)
+import           IdeSession hiding (initSession, updateDataFile, updateDataFileDelete
+                                   ,updateSourceFile, updateSourceFileFromFile
+                                   ,updateSourceFileDelete)
 
 import           Devel.Cabal
 import           Devel.CmdLine
@@ -122,6 +126,7 @@ shouldReload dir event = not (or conditions)
                      Modified _ _ -> True
                      _        -> False
         conditions = [ inPath ".git", inPath "yesod-devel", inPath "dist"
+                     , inPath "rpc."
                      , inPath "session.", inFile ".tmp", inPath "scss"
                      , inFile "#", inPath ".cabal-sandbox", inFile "flycheck_"]
         inPath t = t `Text.isInfixOf` stripPrefix dir p
@@ -137,7 +142,7 @@ handleStatusUpdates loading' loadingText =
           case status of
             NotLoading -> setLoadingText "Currently not loading"
             LoadOK _ -> setLoadingText "Loading complete"
-            LoadFailed msgs -> setLoadingText $ foldl' mappend "" $ intersperse "\n" $ map (either id errorToText) msgs
+            LoadFailed msgs -> setLoadingText $ foldl' mappend "" $ intersperse "\n\n" $ map (either id errorToText) msgs
               where errorToText Error{..} =
                       let locS = Text.pack ("(" <> show (spanSL errorSpan) <> "," <> show (spanSC errorSpan) <> ")")
                           locE = Text.pack ("(" <> show (spanEL errorSpan) <> "," <> show (spanEC errorSpan) <> ")")
@@ -150,6 +155,16 @@ handleStatusUpdates loading' loadingText =
         appendLoadingText t = do Text.putStrLn t
                                  atomically $ modifyTVar loadingText ((t <> "\n") `Text.append`)
 
+updateDataFileDelete _ = updateCodeGeneration True
+
+updateDataFile _ _ = updateCodeGeneration True
+
+updateSourceFileDelete _ = updateCodeGeneration True
+
+updateSourceFileFromFile _ = updateCodeGeneration True
+
+updateSourceFile _ _ = updateCodeGeneration True
+
 handleFilesChanged :: TChan FileChange
                    -> TVar Deps
                    -> TVar IdeSession
@@ -159,45 +174,49 @@ handleFilesChanged :: TChan FileChange
                    -> IO ()
 handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSessionFnTVar loading =
   do filesChanged <- atomically (dupTChan filesChanged')
-     lastChangedFileRef <- I.newIORef Nothing
+     ignoreOnceRef <- I.newIORef Set.empty
      forever $
        do fc@(FileChange filePath fileChangeType fileType) <- atomically $ readTChan filesChanged
+          ignoreOnce <- I.readIORef ignoreOnceRef
+          let skip = FP.normalise filePath `elem` ignoreOnce
+          I.modifyIORef' ignoreOnceRef (Set.delete (FP.normalise filePath))
           print fc
-          exists <- doesFileExist filePath
-          lastChangedFile <- I.readIORef lastChangedFileRef
-          content <- if not exists
-                        then return ""
-                        else do putStrLn $ "reading filepath: " <> filePath
-                                fmap LB.fromStrict (SB.readFile filePath)
-          I.writeIORef lastChangedFileRef (Just (filePath, content))
-          unless (lastChangedFile == Just (filePath, content)) $
-            do deps <- atomically (readTVar depsTVar)
-               let changes = runStateT (execWriterT (updatedDeps deps))
-               (depHsFiles, _) <- changes mempty
-               let extra = mconcat extras
-                   extras = (getExtra depHsFiles)
-               case (fileChangeType, fileType) of
-                 (FileAdded,    HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
-                 (FileAdded,    DataFile)    -> updateFile (updateDataFile filePath content <> extra)
-                 (FileAdded,    StaticFile)  -> updateFile (updateDataFile filePath content <> extra)
-                 (FileModified, HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
-                 (FileModified, DataFile)    -> updateFile (updateDataFile filePath content <> extra)
-                 (FileModified, StaticFile)  -> updateStaticFile (updateDataFile filePath content)
-                 (FileRemoved,  HaskellFile) -> updateFile (updateSourceFileDelete filePath)
-                 (FileRemoved,  DataFile)    -> updateFile (updateDataFileDelete filePath)
-                 (FileRemoved,  StaticFile)  -> updateFile (updateDataFileDelete filePath)
-                 (_,            CabalFile)   ->
-                   do putStrLn "Cabal file changed. Reloading session."
-                      atomically (putTMVar runCommandTMVar Stop)
-                      session <- atomically (readTVar sessionTVar)
-                      shutdownSession session
-                      (newSession, newUpdateSessionFn, newDeps) <- initSession loading
-                      atomically $ do writeTVar sessionTVar newSession
-                                      writeTVar updateSessionFnTVar newUpdateSessionFn
-                                      writeTVar depsTVar newDeps
-                      develHsPath <- checkDevelFile
-                      void (newUpdateSessionFn (updateSourceFileFromFile develHsPath))
-                      atomically (putTMVar runCommandTMVar Start)
+          unless skip $
+            do exists <- doesFileExist filePath
+               content <- if not exists
+                             then return ""
+                             else do putStrLn $ "reading filepath: " <> filePath
+                                     fmap LB.fromStrict (SB.readFile filePath)
+               do deps <- atomically (readTVar depsTVar)
+                  let changes = runStateT (execWriterT (updatedDeps deps))
+                  (depHsFiles, _) <- changes mempty
+                  putStrLn $ "additional deps:  " ++ show depHsFiles
+                  I.modifyIORef' ignoreOnceRef (Set.union (Set.fromList (map FP.normalise depHsFiles)))
+                  mapM_ touchFile depHsFiles
+                  let extra = mconcat extras
+                      extras = (getExtra depHsFiles)
+                  case (fileChangeType, fileType) of
+                    (FileAdded,    HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
+                    (FileAdded,    DataFile)    -> updateFile (updateDataFile filePath content <> extra)
+                    (FileAdded,    StaticFile)  -> updateFile (updateDataFile filePath content <> extra)
+                    (FileModified, HaskellFile) -> updateFile (updateSourceFileFromFile filePath <> extra)
+                    (FileModified, DataFile)    -> updateFile (updateDataFile filePath content <> extra)
+                    (FileModified, StaticFile)  -> updateStaticFile (updateDataFile filePath content)
+                    (FileRemoved,  HaskellFile) -> updateFile (updateSourceFileDelete filePath)
+                    (FileRemoved,  DataFile)    -> updateFile (updateDataFileDelete filePath)
+                    (FileRemoved,  StaticFile)  -> updateFile (updateDataFileDelete filePath)
+                    (_,            CabalFile)   ->
+                      do putStrLn "Cabal file changed. Reloading session."
+                         atomically (putTMVar runCommandTMVar Stop)
+                         session <- atomically (readTVar sessionTVar)
+                         shutdownSession session
+                         (newSession, newUpdateSessionFn, newDeps) <- initSession loading
+                         atomically $ do writeTVar sessionTVar newSession
+                                         writeTVar updateSessionFnTVar newUpdateSessionFn
+                                         writeTVar depsTVar newDeps
+                         develHsPath <- checkDevelFile
+                         void (newUpdateSessionFn (updateSourceFileFromFile develHsPath))
+                         atomically (putTMVar runCommandTMVar Start)
   where getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
         updateStaticFile :: IdeSessionUpdate -> IO ()
         updateStaticFile upd = do session <- atomically (readTVar sessionTVar)

@@ -56,6 +56,7 @@ import           Prelude hiding (FilePath,writeFile,pi)
 import           System.Environment (lookupEnv, unsetEnv)
 import           System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import           System.Directory (getCurrentDirectory)
+import           System.FilePath ((</>))
 import           System.Process (ProcessHandle,
                                  createProcess, env,
                                  getProcessExitCode,
@@ -110,7 +111,7 @@ getCabalFp pkgDir =
      case mcabal of
        Nothing -> throwIO (FPNoCabalFile (FL.toFilePath pkgDir))
        Just cabalfp -> return cabalfp
-                              
+
 -- TODO: fix hardcoded sources...
 stackDir :: FilePath
 stackDir = "dist-stack" FP.</> "x86_64-osx" FP.</> "Cabal-1.22.2.0"
@@ -143,16 +144,14 @@ startSession loading =
      -- let lbi = lbi' {buildDir = FP.encodeString stackBuildDir}
      -- let packageDBs = GlobalPackageDB : reverse (init extraPackageDBs)
      session <-
-       initSession (sessionParams target lbi)
+       initSession (sessionParams target lbi) {sessionInitTargets = TargetsInclude [dirStr </> "Application.hs"]}
                    defaultSessionConfig {configPackageDBStack = map translatePackageDB (withPackageDB lbi)
                                         ,configGenerateModInfo = False
-                                        -- ,configLocalWorkingDir = Just (FL.encodeString dir)
+                                        ,configLocalWorkingDir = Just dirStr
                                         }
-     loadProject
-       session
-       target
+     loadProject session target
      let reloadSession extra =
-           do datafiles <- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
+           do datafiles <- return S.empty -- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
               loadFiles session target datafiles extra loading
      return (session, reloadSession)
   where -- splitColon s = case dropWhile (== ':') s of
@@ -164,8 +163,7 @@ startSession loading =
           defaultSessionInitParams {sessionInitGhcOptions =
                                       ["-hide-all-packages"] <>
                                       (concatMap includePackage (targetDependencies target))}
-          where includePackage pkgName =
-                  ["-package",display pkgName]
+          where includePackage pkgName = ["-package",display pkgName]
 
 
 -- | Translate Cabal's package DB to ide-backend's
@@ -403,9 +401,7 @@ loadProject session target =
 -- | Set GHC options.
 setOpts  :: IdeSession -> Target ->  IO ()
 setOpts sess target =
-  updateSession sess
-                (updateGhcOpts opts) 
-                (const (return ()))
+  updateSession sess (updateGhcOpts opts) print
   where opts = map showExt (targetExtensions target) <> ["-optP-DDEVELOPMENT"]
         showExt :: Extension -> String
         showExt g =
@@ -423,20 +419,20 @@ loadFiles :: IdeSession
           -> IO (Maybe [Either Text Error])
 loadFiles sess target files extra loading =
   do dir <- getCurrentDirectory
-     updates <- forM loadedFiles
-                     (\fp ->
-                        do content <- SB.readFile (FL.encodeString fp)
-                           let sFp =  justStripPrefix (dir <> "/") (FL.encodeString fp)
-                           return (updateSourceFile sFp (L.fromStrict content)))
-     updates' <- forM (S.toList files)
-                      (\fp ->
-                         do content <- SB.readFile (FP.encodeString fp)
-                            let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
-                            return (updateDataFile sFp (L.fromStrict content)))
+     -- updates <- forM loadedFiles
+     --                 (\fp ->
+     --                    do content <- SB.readFile (FL.encodeString fp)
+     --                       let sFp =  justStripPrefix (dir <> "/") (FL.encodeString fp)
+     --                       return (updateSourceFile sFp (L.fromStrict content)))
+     -- updates' <- forM (S.toList files)
+     --                  (\fp ->
+     --                     do content <- SB.readFile (FP.encodeString fp)
+     --                        let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
+     --                        return (updateDataFile sFp (L.fromStrict content)))
      atomically (writeTChan loading NotLoading)
      updateSession
        sess
-       (mconcat updates <> mconcat updates' <> extra <> updateCodeGeneration True)
+       ({- mconcat updates <> mconcat updates'  <> extra <> -} updateCodeGeneration True)
        (\progress ->
           atomically
             (writeTChan loading
