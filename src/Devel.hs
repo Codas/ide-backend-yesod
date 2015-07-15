@@ -177,10 +177,11 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
      ignoreOnceRef <- I.newIORef Set.empty
      forever $
        do fc@(FileChange filePath fileChangeType fileType) <- atomically $ readTChan filesChanged
+          print fc
           ignoreOnce <- I.readIORef ignoreOnceRef
+          print ignoreOnce
           let skip = FP.normalise filePath `elem` ignoreOnce
           I.modifyIORef' ignoreOnceRef (Set.delete (FP.normalise filePath))
-          print fc
           unless skip $
             do exists <- doesFileExist filePath
                content <- if not exists
@@ -189,7 +190,8 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
                                      fmap LB.fromStrict (SB.readFile filePath)
                do deps <- atomically (readTVar depsTVar)
                   let changes = runStateT (execWriterT (updatedDeps deps))
-                  (depHsFiles, _) <- changes mempty
+                  (depHsFiles', _) <- (changes mempty)
+                  let depHsFiles = filter (not . Text.isInfixOf "flycheck_" . Text.pack) depHsFiles'
                   putStrLn $ "additional deps:  " ++ show depHsFiles
                   I.modifyIORef' ignoreOnceRef (Set.union (Set.fromList (map FP.normalise depHsFiles)))
                   mapM_ touchFile depHsFiles
@@ -214,8 +216,6 @@ handleFilesChanged filesChanged' depsTVar sessionTVar runCommandTMVar updateSess
                          atomically $ do writeTVar sessionTVar newSession
                                          writeTVar updateSessionFnTVar newUpdateSessionFn
                                          writeTVar depsTVar newDeps
-                         develHsPath <- checkDevelFile
-                         void (newUpdateSessionFn (updateSourceFileFromFile develHsPath))
                          atomically (putTMVar runCommandTMVar Start)
   where getExtra = map (updateSourceFileDelete <> updateSourceFileFromFile)
         updateStaticFile :: IdeSessionUpdate -> IO ()
