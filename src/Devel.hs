@@ -104,7 +104,7 @@ watchThread writeChan = withManager (\mgr ->
                     (atomically . writeTChan writeChan . toFileChange)
      -- sleep forever (until interrupted)
      forever $ threadDelay (1000 * 1000 * 10))
-  where mgrConfig = defaultConfig {confDebounce = Debounce 2}
+  where mgrConfig = defaultConfig {confUsePolling = True}
         isHsFile :: FP.FilePath -> Bool
         isHsFile fp = FP.takeExtension fp `elem` haskellFileExts
         isCabalFile fp = FP.takeFileName fp == "cabal.sandbox.config" || ".cabal" == FP.takeExtension fp
