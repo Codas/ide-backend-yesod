@@ -80,7 +80,7 @@ data FileChange = FileChange
 data RunCommand = Start | Stop
 
 watchThread :: TChan FileChange -> IO ()
-watchThread writeChan = withManager (\mgr ->
+watchThread writeChan = withManagerConf mgrConfig (\mgr ->
   do dir <- fmap fpToText FS.getWorkingDirectory
      let isStaticFile fp = "/static/" `Text.isPrefixOf` stripPrefix dir (Text.pack (FP.takeDirectory fp))
          toFileChange event =
