@@ -127,9 +127,11 @@ shouldReload dir event = not (or conditions)
         conditions = [ inPath ".git", inPath "yesod-devel", inPath "dist"
                      , inPath "rpc.", inPath "/upload/"
                      , inPath "session.", inFile ".tmp", inPath "scss"
-                     , inFile "#", inPath ".cabal-sandbox", inFile "flycheck_"]
+                     , inFile "#", inPath ".cabal-sandbox", inFile "flycheck_"
+                     , fileStartsWith "."]
         inPath t = t `Text.isInfixOf` stripPrefix dir p
         inFile t = t `Text.isInfixOf` fn
+        fileStartsWith t = t `Text.isPrefixOf` fn
         stripPrefix pre t = fromMaybe t (Text.stripPrefix pre t)
 
 handleStatusUpdates :: TChan LoadingStatus -> TVar Text -> IO ()
