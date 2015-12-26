@@ -75,7 +75,7 @@ getCommandLineOptions = execParser opts
   Auxiliary
 -------------------------------------------------------------------------------}
 
-deriving instance Show SessionConfig
+-- deriving instance Show SessionConfig
 
 instance Show (a -> b) where
   show _ = "<<function>>"

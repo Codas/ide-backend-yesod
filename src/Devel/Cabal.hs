@@ -38,6 +38,7 @@ import qualified Distribution.ModuleName as ModuleName (fromString)
 import           Distribution.Package
 import           Distribution.PackageDescription
 import           Distribution.PackageDescription.Parse
+import           Distribution.PackageDescription.Configuration
 import           Distribution.System
 import           Distribution.Simple.Configure (getPersistBuildConfig)
 import           Distribution.Simple.LocalBuildInfo (LocalBuildInfo(..))
@@ -46,6 +47,7 @@ import qualified Distribution.Simple.Compiler as C
 import           Distribution.Text (display)
 import           Distribution.Version
 import           Filesystem as FP
+import "Glob"    System.FilePath.Glob (glob)
 import           Filesystem.Loc as FL
 import           Filesystem.Path.Find
 import           Filesystem.Path (FilePath)
@@ -53,15 +55,15 @@ import qualified Filesystem.Path.CurrentOS as FP
 import           IdeSession hiding (errorSpan,errorMsg)
 import           Language.Haskell.Extension
 import           Prelude hiding (FilePath,writeFile,pi)
-import           System.Environment (lookupEnv, unsetEnv)
+import           System.Environment (getEnvironment)
 import           System.Exit (ExitCode (..), exitFailure, exitSuccess)
-import           System.Directory (getCurrentDirectory)
-import           System.FilePath ((</>))
+import           System.Directory (getCurrentDirectory, doesFileExist)
+import           System.FilePath ((</>), splitSearchPath)
 import           System.Process (ProcessHandle,
                                  createProcess, env,
                                  getProcessExitCode,
                                  proc, readProcess,
-                                 system,
+                                 system, readProcessWithExitCode,
                                  terminateProcess)
 
 import           Devel.Git
@@ -112,15 +114,22 @@ getCabalFp pkgDir =
        Nothing -> throwIO (FPNoCabalFile (FL.toFilePath pkgDir))
        Just cabalfp -> return cabalfp
 
+getCabalFile :: IO String
+getCabalFile = do
+  list <- glob "*cabal"
+  case list of
+    [] -> fail "No cabal file."
+    (cabalFile:_) -> return cabalFile
+
 -- TODO: fix hardcoded sources...
-stackDir :: FilePath
-stackDir = "dist-stack" FP.</> "x86_64-osx" FP.</> "Cabal-1.22.2.0"
+-- stackDir :: FilePath
+-- stackDir = "dist-stack" FP.</> "x86_64-osx" FP.</> "Cabal-1.22.2.0"
 
-stackBuildDir :: FilePath
-stackBuildDir = stackDir FP.</> "build"
+-- stackBuildDir :: FilePath
+-- stackBuildDir = stackDir FP.</> "build"
 
-stackAutogenDir :: FilePath
-stackAutogenDir = stackBuildDir FP.</> "autogen"
+-- stackAutogenDir :: FilePath
+-- stackAutogenDir = stackBuildDir FP.</> "autogen"
 
 -- | Start the session with the cabal file, will not proceed if the
 -- targets are unambiguous, in which case it will be continued later
@@ -128,66 +137,106 @@ stackAutogenDir = stackBuildDir FP.</> "autogen"
 startSession :: TChan LoadingStatus
              -> IO (IdeSession, IdeSessionUpdate -> IO (Maybe [Either Text Error]))
 startSession loading =
-  do env <- lookupEnv "GHC_PACKAGE_PATH"
-     -- extraPackageDBs <- case env of
-     --                      Nothing -> return []
-     --                      Just packageDBs ->
-     --                        do unsetEnv "GHC_PACKAGE_PATH"
-     --                           return $ fmap SpecificPackageDB (splitColon packageDBs)
-     dir <- getWorkingDir
+  do dir <- getWorkingDir
      dirStr <- getCurrentDirectory
      cabalfp <- getCabalFp dir
      target <- getTarget cabalfp
-     configure
-     lbi <- getPersistBuildConfig (FP.encodeString (FL.toFilePath dir FP.</> "dist"))
-     -- lbi' <- getPersistBuildConfig (FP.encodeString (FL.toFilePath dir FP.</> stackDir))
-     -- let lbi = lbi' {buildDir = FP.encodeString stackBuildDir}
-     -- let packageDBs = GlobalPackageDB : reverse (init extraPackageDBs)
+     (extensionList, srcDir, cabalSrcList, packageName) <- getExtensions
+     packages <- getPackages packageName
+     void (configure packageName)
+     let flags = packages ++ extensionList ++ opts target
+     sessionConfig <- sessionConfigFromEnv
      session <-
-       initSession (sessionParams target lbi) {sessionInitTargets = TargetsInclude [dirStr </> "Application.hs"]}
-                   defaultSessionConfig {configPackageDBStack = map translatePackageDB (withPackageDB lbi)
-                                        ,configGenerateModInfo = False
-                                        ,configLocalWorkingDir = Just dirStr
-                                        }
-     loadProject session target
-     let reloadSession extra =
-           do datafiles <- return S.empty -- getGitFiles >>= fmap S.fromList . filterM isFile . S.toList
-              loadFiles session target datafiles extra loading
+       initSession (sessionParams flags dirStr)
+                   sessionConfig {configGenerateModInfo = False
+                                 ,configLocalWorkingDir = Just dirStr}
+     let reloadSession extra = loadFiles session target S.empty extra loading
      return (session, reloadSession)
-  where -- splitColon s = case dropWhile (== ':') s of
-        --                  "" -> []
-        --                  s' -> w : splitColon s''
-        --                    where (w, s'') = break (== ':') s'
-        sessionParams :: Target -> LocalBuildInfo -> SessionInitParams
-        sessionParams target lbi =
-          defaultSessionInitParams {sessionInitGhcOptions =
-                                      ["-hide-all-packages"] <>
-                                      (concatMap includePackage (targetDependencies target))}
-          where includePackage pkgName = ["-package",display pkgName]
+  where sessionParams flags dirStr =
+          defaultSessionInitParams {sessionInitGhcOptions = ["-w", "-dynamic", "-O0", "-hide-all-packages"] <> flags
+                                   ,sessionInitTargets = TargetsInclude [dirStr </> "Application.hs"]}
+        opts target = map showExt (targetExtensions target) <> ["-optP-DDEVELOPMENT"]
+        showExt :: Extension -> String
+        showExt (EnableExtension e) = "-X" <> show e
+        showExt (DisableExtension e) = "-XNo" <> show e
+        showExt (UnknownExtension e) = "-X" <> show e
 
 
--- | Translate Cabal's package DB to ide-backend's
---
--- (This is only necessary because ide-backend currently uses Cabal-ide-backend,
--- a private copy of Cabal. Once that is gone this function is no longer
--- required).
-translatePackageDB :: C.PackageDB -> PackageDB
-translatePackageDB C.GlobalPackageDB        = GlobalPackageDB
-translatePackageDB C.UserPackageDB          = UserPackageDB
-translatePackageDB (C.SpecificPackageDB fp) = SpecificPackageDB fp
+getPackages :: String -> IO [String]
+getPackages pkg = do
+  (_, stdout, _) <- readProcessWithExitCode "stack" ["list-dependencies"] ""
+  let packageList :: [String]
+      packageList = concatMap (\s -> ["-package", s]) $ filter (/= pkg) $ map (takeWhile (/= ' ')) $ lines stdout
+  return ("-hide-all-packages" : packageList)
 
-configure :: IO Bool
-configure =
-  checkExit =<< createProcess (proc "cabal" $
-                                 [ "configure"
-                                 , "-flibrary-only"
-                                 , "--disable-tests"
-                                 , "--disable-benchmarks"
-                                 , "-fdev"
-                                 , "-fdevel"
-                                 , "--disable-library-profiling"
-                                 ]
-               )
+-- | Parse the cabal file to get the ghc extensions in use.
+getExtensions :: IO ([String], [String], [String], String)
+getExtensions = do
+  cabalFilePath <- getCabalFile
+  cabalFile <- Prelude.readFile cabalFilePath
+
+  let unsafePackageDescription = parsePackageDescription cabalFile
+
+      genericPackageDescription = case unsafePackageDescription of
+                                ParseOk _ a -> a
+                                _           -> error "failed package description."
+
+      packDescription = flattenPackageDescription genericPackageDescription
+
+      packName = unPackageName (pkgName (package packDescription))
+
+      rawExt = usedExtensions $ head $ allBuildInfo packDescription
+
+      lib = fromMaybe emptyLibrary $ library packDescription
+
+      -- I think it would be wise to avoid src files under executable to avoid conflict.
+      srcDir  = hsSourceDirs $ libBuildInfo lib
+      srcList = extraSrcFiles packDescription
+
+
+      parseExtension :: Extension -> String
+      parseExtension (EnableExtension extension) =  "-X" ++ show extension
+      parseExtension (DisableExtension extension) = "-XNo" ++ show extension
+      parseExtension (UnknownExtension extension) = "-X" ++ show extension
+
+      extensions = map parseExtension rawExt
+
+      -- Now we handle source files from executable section here.
+      execList = executables packDescription
+
+  paths <- mapM getPathList execList
+
+  return (extensions, srcDir, srcList ++ concat paths, packName)
+  where
+    getPathList :: Executable -> IO [String]
+    getPathList exec =
+      let mainModule' = modulePath exec
+          bInfo = buildInfo exec
+          execModuleList = otherModules bInfo
+          srcDirsList = hsSourceDirs bInfo
+          execSrcFileList = map C.toFilePath execModuleList
+          nonPaths = [dir </> fp | fp <- execSrcFileList, dir <- srcDirsList]
+          paths' = map (</> mainModule' ) srcDirsList -- For the main module
+                   ++ [x++y | x <- nonPaths, y <- [".hs", ".lhs"]]
+
+      in filterM doesFileExist paths'
+
+
+configure :: String -> IO Bool
+configure pkgName =
+  do env <- getEnvironment
+     status <- createProcess (proc "stack"
+                                [ "build"
+                                , "--only-configure"
+                                , "--flag"
+                                , pkgName ++ ":-library-only"
+                                , "--flag"
+                                , pkgName ++ ":-dev"
+                                , "--no-test"
+                                , "--no-bench"
+                                , "--no-library-profiling"
+                                ])
+     checkExit status
 
 -- | Get library target of a package.
 getTarget :: Loc 'Absolute 'File -> IO Target
@@ -391,24 +440,6 @@ flagMap = M.fromList . map pair
         pair (MkFlag (unName -> name) _desc def _manual) = (name,def)
         unName (FlagName t) = T.pack t
 
--- | Load the project into the ide-backend.
-loadProject :: IdeSession
-            -> Target
-            -> IO ()
-loadProject session target =
-  void (forkIO (setOpts session target))
-
--- | Set GHC options.
-setOpts  :: IdeSession -> Target ->  IO ()
-setOpts sess target =
-  updateSession sess (updateGhcOpts opts) print
-  where opts = map showExt (targetExtensions target) <> ["-optP-DDEVELOPMENT"]
-        showExt :: Extension -> String
-        showExt g =
-          case g of
-            EnableExtension e -> "-X" <> show e
-            DisableExtension e -> "-XNo" <> show e
-            UnknownExtension e -> "-X" <> show e
 
 -- | Load the package files and update the app state of the progress.
 loadFiles :: IdeSession
@@ -418,28 +449,13 @@ loadFiles :: IdeSession
           -> TChan LoadingStatus
           -> IO (Maybe [Either Text Error])
 loadFiles sess target files extra loading =
-  do dir <- getCurrentDirectory
-     -- updates <- forM loadedFiles
-     --                 (\fp ->
-     --                    do content <- SB.readFile (FL.encodeString fp)
-     --                       let sFp =  justStripPrefix (dir <> "/") (FL.encodeString fp)
-     --                       return (updateSourceFile sFp (L.fromStrict content)))
-     -- updates' <- forM (S.toList files)
-     --                  (\fp ->
-     --                     do content <- SB.readFile (FP.encodeString fp)
-     --                        let sFp =  justStripPrefix (dir <> "/") (FP.encodeString fp)
-     --                        return (updateDataFile sFp (L.fromStrict content)))
-     atomically (writeTChan loading NotLoading)
+  do atomically (writeTChan loading NotLoading)
      updateSession
        sess
-       ({- mconcat updates <> mconcat updates'  <> extra <> -} updateCodeGeneration True)
-       (\progress ->
+       (updateCodeGeneration True)
+       (\updateStatus ->
           atomically
-            (writeTChan loading
-                       (Loading (progressStep progress)
-                                (progressNumSteps progress)
-                                (fromMaybe (fromMaybe "Unknown step" (progressOrigMsg progress))
-                                           (progressParsedMsg progress)))))
+            (writeTChan loading (handleUpdateStatus updateStatus)))
      errs <- fmap (filter isError)
                   (getSourceErrors sess)
      putStrLn  "Updates done"
@@ -448,7 +464,17 @@ loadFiles sess target files extra loading =
                 return Nothing
         else do atomically (writeTChan loading (LoadFailed (map toError errs)))
                 return (Just (map toError errs))
-  where loadedFiles = S.toList (targetFiles target)
+  where handleUpdateStatus (UpdateStatusProgress progress) =
+          (Loading (progressStep progress)
+                   (progressNumSteps progress)
+                   (fromMaybe (fromMaybe "Unknown step" (progressOrigMsg progress))
+                              (progressParsedMsg progress)))
+        handleUpdateStatus UpdateStatusDone            = LoadOK ["All Done"]
+        handleUpdateStatus UpdateStatusFailedToRestart = LoadFailed [Left "Server died, failed to restart"]
+        handleUpdateStatus (UpdateStatusFailed t)      = LoadFailed [Left t]
+        handleUpdateStatus (UpdateStatusErrorRestart t)= LoadFailed [Left t]
+        handleUpdateStatus UpdateStatusRequiredRestart = LoadFailed [Left "Restart Required"]
+        loadedFiles = S.toList (targetFiles target)
         justStripPrefix p s = fromMaybe s (stripPrefix p s)
         isError (SourceError{errorKind = k}) =
           case k of

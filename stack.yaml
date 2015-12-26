@@ -3,10 +3,10 @@ flags:
 packages:
 - '.'
 - '../ide-backend/ide-backend'
-- '../ide-backend/ide-backend-rts'
 - '../ide-backend/ide-backend-server'
 - '../ide-backend/ide-backend-common'
 extra-deps:
 - hfsevents-0.1.5
-- Cabal-1.22.3.0
-resolver: nightly-2015-06-08
+- Cabal-1.22.4.0
+- cabal-install-1.22.6.0
+resolver: lts-3.15
