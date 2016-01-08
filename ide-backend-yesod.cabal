@@ -25,29 +25,29 @@ executable ydevel
                      , Filesystem.Path.Find
                      , Filesystem.Loc
   build-depends:       base                 >= 4.5  && < 5
-                     , bytestring           >= 0.10 && < 0.11
+                     , bytestring
                        -- NOTE: Cabal 1.22 has some backwards incompatible API
                        -- changes. If we want to support older Cabal we need to
                        -- introduce a shim.
-                     , Cabal                >= 1.22.3 && < 1.23
-                     , directory            >= 1.2  && < 1.3
-                     , filepath             >= 1.3  && < 1.5
-                     , ide-backend          >= 0.9  && < 1.0
-                     , optparse-applicative >= 0.11 && < 0.12
-                     , text                 >= 1.1  && < 1.3
-                     , utf8-string          >= 0.3  && < 1.1
+                     , Cabal
+                     , directory
+                     , filepath
+                     , ide-backend
+                     , optparse-applicative
+                     , text
+                     , utf8-string
 
                      , ide-backend-rts
 
                      , lifted-base
-                     , attoparsec           >= 0.10
-                     , shakespeare          >= 2.0
-                     , monad-loops          >= 0.4.2.1
-                     , system-fileio        >= 0.3.14
-                     , system-filepath      >= 0.4.12
-                     , containers           >= 0.5.5.1
-                     , warp                 >= 1.3.7.5
-                     , wai                  >= 1.4
+                     , attoparsec
+                     , shakespeare
+                     , monad-loops
+                     , system-fileio
+                     , system-filepath
+                     , containers
+                     , warp
+                     , wai
                      , wai-extra
                      , data-default-class
                      , streaming-commons
@@ -62,15 +62,15 @@ executable ydevel
                      , file-embed
                      , template-haskell
                      , process
-                     , conduit              >= 1.2.0.2
-                     , conduit-extra        >= 1.1.4
-                     , exceptions           >= 0.6.1
-                     , warp-tls             >= 3.0.1
+                     , conduit
+                     , conduit-extra
+                     , exceptions
+                     , warp-tls
                      , http-client
-                     , http-conduit         >= 2.1.4
-                     , http-reverse-proxy   >= 0.4
-                     , fsnotify             >= 0.0  && < 0.3
-                     , unix-compat          >= 0.2  && < 0.5
+                     , http-conduit
+                     , http-reverse-proxy
+                     , fsnotify
+                     , unix-compat
                      , Glob
   hs-source-dirs:      src
   default-language:    Haskell2010
