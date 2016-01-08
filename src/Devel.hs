@@ -80,7 +80,7 @@ data FileChange = FileChange
 data RunCommand = Start | Stop
 
 watchThread :: TChan FileChange -> IO ()
-watchThread writeChan = withManagerConf mgrConfig (\mgr ->
+watchThread writeChan = withManager (\mgr ->
   do dir <- fmap fpToText FS.getWorkingDirectory
      let isStaticFile fp = "/static/" `Text.isPrefixOf` stripPrefix dir (Text.pack (FP.takeDirectory fp))
          toFileChange event =
@@ -104,7 +104,7 @@ watchThread writeChan = withManagerConf mgrConfig (\mgr ->
                     (atomically . writeTChan writeChan . toFileChange)
      -- sleep forever (until interrupted)
      forever $ threadDelay (1000 * 1000 * 10))
-  where mgrConfig = defaultConfig {confUsePolling = True}
+  where --mgrConfig = defaultConfig {confUsePolling = True}
         isHsFile :: FP.FilePath -> Bool
         isHsFile fp = FP.takeExtension fp `elem` haskellFileExts
         isCabalFile fp = FP.takeFileName fp == "cabal.sandbox.config" || ".cabal" == FP.takeExtension fp
